@@ -756,3 +756,389 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(messages[0].role).toBe("assistant");
 	});
 });
+
+describe("agent loop error handling", () => {
+	/**
+	 * Issue: Unhandled async errors in the agent loop hang the stream forever.
+	 *
+	 * The agent loop spawns an async task (runAgentLoop) and pipes events into
+	 * an EventStream. If that async task rejects — e.g. because convertToLlm,
+	 * transformContext, or getApiKey throws — and there is no .catch(), the
+	 * EventStream never receives an end signal. Any consumer doing
+	 * `for await (const event of stream)` will hang indefinitely.
+	 */
+	it("should terminate stream when convertToLlm throws instead of hanging", { timeout: 5000 }, async () => {
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: () => {
+				throw new Error("convertToLlm exploded");
+			},
+		};
+
+		const streamFn = () => {
+			throw new Error("should not be called");
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// Stream must terminate (not hang) and include an agent_end event
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
+	});
+
+	it("should terminate stream when transformContext throws instead of hanging", { timeout: 5000 }, async () => {
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			transformContext: async () => {
+				throw new Error("transformContext exploded");
+			},
+		};
+
+		const streamFn = () => {
+			throw new Error("should not be called");
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
+	});
+
+	it("should terminate stream when getApiKey throws instead of hanging", { timeout: 5000 }, async () => {
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			getApiKey: async () => {
+				throw new Error("getApiKey exploded");
+			},
+		};
+
+		const streamFn = () => {
+			throw new Error("should not be called");
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
+	});
+
+	/**
+	 * Issue: stopReason "toolUse" with no tool call content blocks causes silent idle.
+	 *
+	 * When a proxy or network issue truncates a streaming response, the LLM may
+	 * report stopReason="toolUse" but the response contains no tool call blocks.
+	 * The agent loop would normally try to execute tool calls, find none, and
+	 * exit the inner loop — but the stopReason still indicates tool use, leading
+	 * to ambiguous state. The fix detects this mismatch and converts it to an
+	 * error with a diagnostic message.
+	 *
+	 * Evidence: 777 sessions in production hit this exact pattern, producing
+	 * errorMessage: 'LLM returned stopReason "toolUse" but no tool call content
+	 * blocks were present.'
+	 */
+	it("should convert stopReason toolUse with no tool calls to error", async () => {
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				// Simulate truncated response: stopReason says toolUse but content is only text
+				const message = createAssistantMessage([{ type: "text", text: "I will now use a tool..." }], "toolUse");
+				stream.push({ type: "done", reason: "toolUse", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// Should have converted to error and terminated
+		const messageEnd = events.find((e) => e.type === "message_end" && e.message.role === "assistant");
+		expect(messageEnd).toBeDefined();
+		if (messageEnd?.type === "message_end" && messageEnd.message.role === "assistant") {
+			expect(messageEnd.message.stopReason).toBe("error");
+			expect(messageEnd.message.errorMessage).toContain("no tool call content blocks");
+		}
+
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
+	});
+
+	it("should convert stopReason toolUse with no tool calls to error (via for-await path)", async () => {
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [],
+			tools: [],
+		};
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		// Use the for-await path: emit start + text_delta events, then done (no "done"/"error" case arm)
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			const partial = createAssistantMessage([{ type: "text", text: "" }], "toolUse");
+
+			queueMicrotask(async () => {
+				stream.push({ type: "start", partial });
+
+				const updatedPartial = createAssistantMessage([{ type: "text", text: "I will now..." }], "toolUse");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "I will now...", partial: updatedPartial });
+
+				// End without going through the "done" case — fall through to the
+				// code path after the for-await loop
+				const finalMessage = createAssistantMessage([{ type: "text", text: "I will now..." }], "toolUse");
+				stream.push({ type: "done", reason: "toolUse", message: finalMessage });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messageEnd = events.find((e) => e.type === "message_end" && e.message.role === "assistant");
+		expect(messageEnd).toBeDefined();
+		if (messageEnd?.type === "message_end" && messageEnd.message.role === "assistant") {
+			expect(messageEnd.message.stopReason).toBe("error");
+			expect(messageEnd.message.errorMessage).toContain("no tool call content blocks");
+		}
+	});
+
+	/**
+	 * Issue: Orphaned tool results crash the next LLM call.
+	 *
+	 * After a process crash mid-tool-execution, or after conversation compaction
+	 * removes an assistant message but leaves its tool results, the message
+	 * history can contain toolResult messages whose toolCallId doesn't match any
+	 * toolCall in the preceding assistant message. The Anthropic API rejects
+	 * these with: "unexpected tool_use_id found in tool_result block".
+	 *
+	 * The sanitizeMessages function strips these orphaned results before calling
+	 * the LLM, so the conversation can continue.
+	 */
+	it("should strip orphaned tool results before calling LLM", async () => {
+		let capturedLlmMessages: Message[] = [];
+
+		const assistantWithTool = createAssistantMessage(
+			[{ type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "ls" } }],
+			"toolUse",
+		);
+
+		const matchingResult: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "tool-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "file.txt" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		// Orphaned result — its toolCallId does not match any toolCall above
+		const orphanedResult: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "tool-ORPHAN",
+			toolName: "bash",
+			content: [{ type: "text", text: "orphaned output" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [
+				createUserMessage("first"),
+				assistantWithTool,
+				matchingResult,
+				orphanedResult, // This should be stripped
+			],
+			tools: [],
+		};
+
+		const userPrompt: AgentMessage = createUserMessage("continue");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		// Capture messages from the streamFn — these are post-sanitization
+		const streamFn = (_model: any, ctx: any) => {
+			capturedLlmMessages = ctx.messages;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "ok" }]);
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+		for await (const _ of stream) {
+			// consume
+		}
+
+		// The orphaned tool result should have been removed
+		const toolResults = capturedLlmMessages.filter((m) => m.role === "toolResult");
+		expect(toolResults.length).toBe(1);
+		expect((toolResults[0] as any).toolCallId).toBe("tool-1");
+
+		// The matching result should not be present
+		const orphans = capturedLlmMessages.filter(
+			(m) => m.role === "toolResult" && (m as any).toolCallId === "tool-ORPHAN",
+		);
+		expect(orphans.length).toBe(0);
+	});
+
+	it("should keep tool results that match their preceding assistant toolCall ids", async () => {
+		let capturedLlmMessages: Message[] = [];
+
+		const assistantWithTools = createAssistantMessage(
+			[
+				{ type: "toolCall", id: "tool-A", name: "bash", arguments: { command: "ls" } },
+				{ type: "toolCall", id: "tool-B", name: "bash", arguments: { command: "pwd" } },
+			],
+			"toolUse",
+		);
+
+		const resultA: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "tool-A",
+			toolName: "bash",
+			content: [{ type: "text", text: "file.txt" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		const resultB: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "tool-B",
+			toolName: "bash",
+			content: [{ type: "text", text: "/home" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [createUserMessage("do stuff"), assistantWithTools, resultA, resultB],
+			tools: [],
+		};
+
+		const userPrompt: AgentMessage = createUserMessage("continue");
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		// Capture messages from the streamFn — these are post-sanitization
+		const streamFn = (_model: any, ctx: any) => {
+			capturedLlmMessages = ctx.messages;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+		for await (const _ of stream) {
+			// consume
+		}
+
+		// Both matching results should be preserved
+		const toolResults = capturedLlmMessages.filter((m) => m.role === "toolResult");
+		expect(toolResults.length).toBe(2);
+		expect((toolResults[0] as any).toolCallId).toBe("tool-A");
+		expect((toolResults[1] as any).toolCallId).toBe("tool-B");
+	});
+
+	it("should handle agentLoopContinue errors without hanging", { timeout: 5000 }, async () => {
+		const context: AgentContext = {
+			systemPrompt: "test",
+			messages: [createUserMessage("Hello")],
+			tools: [],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: () => {
+				throw new Error("boom");
+			},
+		};
+
+		const streamFn = () => {
+			throw new Error("should not be called");
+		};
+
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
+	});
+});

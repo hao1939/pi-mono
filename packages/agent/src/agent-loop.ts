@@ -47,11 +47,13 @@ export function agentLoop(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	}).catch((err) => {
-		terminateStreamOnError(stream, err);
-	});
+	)
+		.then((messages) => {
+			stream.end(messages);
+		})
+		.catch((err) => {
+			terminateStreamOnError(stream, err);
+		});
 
 	return stream;
 }
@@ -88,11 +90,13 @@ export function agentLoopContinue(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	}).catch((err) => {
-		terminateStreamOnError(stream, err);
-	});
+	)
+		.then((messages) => {
+			stream.end(messages);
+		})
+		.catch((err) => {
+			terminateStreamOnError(stream, err);
+		});
 
 	return stream;
 }
